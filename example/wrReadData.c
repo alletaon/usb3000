@@ -1,0 +1,416 @@
+//******************************************************************************
+// консольная программа для ввода данных в РС из модуля USB3000,
+// используя при этом библиотеку-оболочку wrRtusbapi.dll
+//******************************************************************************
+#include <stdio.h>
+#include <conio.h>
+#include <math.h>
+#include "wrRtusbapi.h"
+
+// выход из программы
+void TerminateApplication(char *ErrorString, BOOL TerminationFlag);
+// ожидание завершения очередного запроса на ввод данных
+BOOL WaitingForRequestCompleted(OVERLAPPED *ReadOv);
+// отображение ошибок выполнения программы
+void ShowThreadErrorMessage(void);
+
+// функция потока ввода данных с модуля
+DWORD 	WINAPI ServiceReadThread(PVOID /*Context*/);
+// идентификатор потока ввода
+HANDLE 	hReadThread;
+DWORD 	ReadTid;
+
+// идентификатор файла для записи полученных данных
+HANDLE hFile;
+
+// текущая версия библиотеки Rtusbapi.dll
+DWORD DllVersion;
+// указатель на интерфейс модуля
+LPVOID pModule;
+// дескриптор устройства
+HANDLE hModule;
+// хэндл модуля
+HANDLE ModuleHandle;
+// название модуля
+char ModuleName[10];
+// скорость работы шины USB
+BYTE UsbSpeed;
+// серийный номер модуля
+char ModuleSerialNumber[9];
+// версия драйвера AVR
+char AvrVersion[5];
+// структура, содержащая информацию о версии драйвера DSP
+DSP_INFO_USB3000 di;
+// структура информации в ППЗУ модуля
+FLASH_USB3000 fi;
+// структура параметров работы АЦП
+INPUT_PARS_USB3000 ip;
+
+// максимально возможное кол-во опрашиваемых виртуальных слотов
+const WORD MaxVirtualSoltsQuantity = 127;
+// частота  ввода данных
+const double ReadRate = 3000.0;
+
+//max возможное кол-во передаваемых отсчетов (кратное 32) для ф. ReadData и WriteData()
+DWORD DataStep = 1024*1024;
+// столько блоков по DataStep отсчётов нужно собрать в файл
+const WORD NBlockRead = 20;
+// указатель на буфер для вводимых данных
+SHORT *ReadBuffer;
+
+// экранный счетчик-индикатор
+DWORD Counter = 0x0, OldCounter = 0xFFFFFFFF;
+
+// номер ошибки при выполнении потока сбора данных
+WORD ThreadErrorNumber;
+// флажок завершения потоков ввода данных
+BOOL IsThreadComplete = FALSE;
+
+SHORT AdcSample;
+
+//------------------------------------------------------------------------
+// основная программа
+//------------------------------------------------------------------------
+void main(void)
+{
+	char String[128];
+	WORD i;
+	DWORD FileBytesWritten;
+
+	// зачистим экран монитора	
+	system("cls");
+
+	printf(" ***********************************************************************\n");
+	printf(" Data Reading Console Example for USB3000 unit using apper Rtusbapi \n");
+	printf(" ***********************************************************************\n\n");
+
+	// проверим версию используемой библиотеки Rtusbapi.dll
+	if((DllVersion = GetDllVersion_Rtusbapi()) != CURRENT_VERSION_RTUSBAPI) 
+	{	
+		sprintf(String, " Rtusbapi.dll Version Error!!!\n   Current: %1u.%1u. Required: %1u.%1u",
+											DllVersion >> 0x10, DllVersion & 0xFFFF,
+											CURRENT_VERSION_RTUSBAPI >> 0x10, CURRENT_VERSION_RTUSBAPI & 0xFFFF);
+		
+		TerminateApplication(String, TRUE);
+	}		
+	else printf(" Rtusbapi.dll Version --> OK\n");
+
+	// получим указатель на интерфейс модуля USB3000
+	pModule = (LPVOID *)CreateInstance_Rtusbapi("usb3000");
+	if(!pModule) TerminateApplication(" Module Interface --> Bad\n", TRUE);
+	else printf(" Module Interface --> OK\n");
+
+	// попробуем обнаружить модуль USB3000 в первых 127 виртуальных слотах
+	for(i = 0x0; i < MaxVirtualSoltsQuantity; i++) if(OpenDevice_Usb3000(pModule, i)) break;
+	// что-нибудь обнаружили?
+	if(i == MaxVirtualSoltsQuantity) TerminateApplication(" Can't find module USB3000 in first 127 virtual slots!\n", TRUE);
+	else printf(" OpenDevice_Usb3000(%u) --> OK\n", i);
+
+	// попробуем получить дескриптор (handle) устройства
+	hModule = GetModuleHandle_Usb3000(pModule);
+	if(hModule == INVALID_HANDLE_VALUE) TerminateApplication(" Can't get module handle!\n", TRUE);
+	else printf(" GetModuleHandle_Usb3000() --> OK\n");
+
+	// прочитаем название обнаруженного модуля 
+	if(!GetModuleName_Usb3000(pModule, ModuleName)) TerminateApplication(" GetModuleName_Usb3000() --> Bad\n", TRUE);
+	else printf(" GetModuleName_Usb3000() --> OK\n");
+	// проверим, что это 'USB3000'
+	if(strcmp(ModuleName, "USB3000")) TerminateApplication(" The module is not 'USB3000'\n", TRUE);
+	else printf(" The module is 'USB3000'\n");
+
+	// узнаем текущую скорость работы шины USB20
+	if(!GetUsbSpeed_Usb3000(pModule, &UsbSpeed)) { printf(" GetUsbSpeed_Usb3000() --> Bad\n"); exit(1); }
+	else printf(" GetUsbSpeed_Usb3000() --> OK\n");
+	// теперь отобразим версию драйвера AVR
+	printf(" USB Speed is %s\n", UsbSpeed ? "HIGH (480 Mbit/s)" : "FULL (12 Mbit/s)");
+
+	// прочитаем серийный номер модуля
+	if(!GetModuleSerialNumber_Usb3000(pModule, ModuleSerialNumber)) TerminateApplication(" GetModuleSerialNumber_Usb3000() --> Bad\n", TRUE);
+	else printf(" GetModuleSerialNumber_Usb3000() --> OK\n");
+	// теперь отобразим серийный номер модуля
+	printf(" Module Serial Number is %s\n", ModuleSerialNumber);
+
+	// прочитаем версию драйвера AVR
+	if(!GetAvrVersion_Usb3000(pModule, AvrVersion)) TerminateApplication(" GetAvrVersion_Usb3000() --> Bad\n", TRUE);
+	else printf(" GetAvrVersion_Usb3000() --> OK\n");
+	// теперь отобразим версию драйвера AVR
+	printf(" Avr Driver Version is %s\n", AvrVersion);
+
+	// код драйвера DSP возьмём из соответствующего ресурса штатной DLL библиотеки
+	if(!LOAD_DSP_Usb3000(pModule, NULL)) TerminateApplication(" LOAD_DSP_Usb3000() --> Bad\n", TRUE);
+	else printf(" LOAD_DSP_Usb3000() --> OK\n");
+
+	// проверим загрузку модуля
+ 	if(!MODULE_TEST_Usb3000(pModule)) TerminateApplication(" MODULE_TEST_Usb3000() --> Bad\n", TRUE);
+	else printf(" MODULE_TEST_Usb3000() --> OK\n");
+
+	// получим версию загруженного драйвера DSP
+	if(!GET_DSP_INFO_Usb3000(pModule, &di)) TerminateApplication(" GET_DSP_INFO_Usb3000() --> Bad\n", TRUE);
+	else printf(" GET_DSP_INFO_Usb3000() --> OK\n");
+	// теперь отобразим версию загруженного драйвера DSP
+	printf(" DSP Driver version is %1u.%1u\n", di.DspMajor, di.DspMinor);
+
+	// обязательно проинициализируем поле size структуры RTUSB3000::FLASH
+	fi.size = sizeof(FLASH_USB3000);
+	// получим информацию из ППЗУ модуля
+	if(!GET_FLASH_Usb3000(pModule, &fi)) TerminateApplication(" GET_FLASH_Usb3000() --> Bad\n", TRUE);
+	else printf(" GET_FLASH_Usb3000() --> OK\n");
+
+	// обязательно проинициализируем поле size структуры RTUSB3000::INPUT_PARS
+	ip.size = sizeof(INPUT_PARS_USB3000);
+	// получим текущие параметры работы АЦП
+	if(!GET_INPUT_PARS_Usb3000(pModule, &ip)) TerminateApplication(" GET_INPUT_PARS_Usb3000() --> Bad\n", TRUE);
+	else printf(" GET_INPUT_PARS_Usb3000() --> OK\n");
+
+	// установим желаемые параметры АЦП
+	ip.CorrectionEnabled = TRUE;				// разрешим корректировку вводимых данных
+	ip.InputClockSource = INTERNAL_INPUT_CLOCK_USB3000;	// будем использовать внутренние тактовые испульсы для ввода данных
+//	ip.InputClockSource = EXTERNAL_INPUT_CLOCK_USB3000;	// будем использовать внешние тактовые испульсы для ввода данных
+	ip.SynchroType = NO_SYNCHRO_USB3000;			// не будем использовать никакую синхронизацию при вводе данных 
+//	ip.SynchroType = TTL_START_SYNCHRO_USB3000;	// будем использовать цифровую синхронизацию старта при вводе данных  
+	ip.ChannelsQuantity = 0x4;					// четыре активных канала
+	for(i = 0x0; i < ip.ChannelsQuantity; i++) ip.ControlTable[i] = (WORD)(i);
+	ip.InputRate = ReadRate;					// частота работы АЦП в кГц
+	ip.InterKadrDelay = 0.0;					// межкадровая задержка - пока всегда устанавливать в 0.0
+	ip.InputFifoBaseAddress = 0x0;  			// базовый адрес FIFO буфера АЦП
+	ip.InputFifoLength = 0x3000;	 			// длина FIFO буфера АЦП
+	// будем использовать фирменные калибровочные коэффициенты, которые храняться в ППЗУ модуля
+	for(i = 0x0; i < 0x8; i++) { ip.AdcOffsetCoef[i] = fi.AdcOffsetCoef[i]; ip.AdcScaleCoef[i] = fi.AdcScaleCoef[i]; }
+	// передадим требуемые параметры работы АЦП в модуль
+	if(!SET_INPUT_PARS_Usb3000(pModule, &ip)) TerminateApplication(" SET_INPUT_PARS_Usb3000() --> Bad\n", TRUE);
+	else printf(" SET_INPUT_PARS_Usb3000() --> OK\n");
+
+	// отобразим на экране дисплея параметры работы модуля USB3000
+	printf(" \n");
+	printf(" Module USB3000 (S/N %s) is ready ... \n", ModuleSerialNumber);
+	printf(" Adc parameters:\n");
+	printf("   InputClockSource is %s\n", ip.InputClockSource ? "EXTERNAL" : "INTERNAL");
+	printf("   SynchroType is %s\n", ip.SynchroType ? "TTL_START_SYNCHRO" : "NO_SYNCHRO");
+	printf("   ChannelsQuantity = %2d\n", ip.ChannelsQuantity);
+	printf("   AdcRate = %8.3f kHz\n", ip.InputRate);
+	printf("   InterKadrDelay = %2.4f ms\n", ip.InterKadrDelay);
+	printf("   ChannelRate = %8.3f kHz\n", ip.ChannelRate);
+
+	// пока откытого файла нет :(
+	hFile = INVALID_HANDLE_VALUE;
+	// сбросим флаг ошибок потока ввода данных
+	ThreadErrorNumber = 0x0;
+
+	// попробуем выделить память под буфер для вводимых с модуля данных
+	ReadBuffer = NULL;
+	ReadBuffer = malloc(NBlockRead * DataStep * sizeof(SHORT));
+	if(!ReadBuffer) TerminateApplication(" Cannot allocate memory for ReadBuffer :(((\n", TRUE);
+
+	// Создаем и запускаем поток сбора ввода данных из модуля
+	hReadThread=CreateThread(0x0, 0x2000, ServiceReadThread, 0x0, 0x0, &ReadTid);
+	if(!hReadThread) TerminateApplication("Can't start input data thread!", TRUE);
+
+	// ждем завершения работы нужного потока
+	printf("\n");
+	while(!IsThreadComplete)
+	{
+		if(OldCounter != Counter) { printf(" Counter %4u from %4u\r", Counter, NBlockRead); OldCounter = Counter; }
+		Sleep(20);
+	}
+
+	// ждём окончания работы потока вывода данных
+	WaitForSingleObject(hReadThread, INFINITE);
+	// две пустые строчки
+	printf("\n\n");
+
+	// если не было ошибок ввода данных - запишем полученные данные в файл
+ 	if(!ThreadErrorNumber)
+	{
+		// откроем файл для записи полученных данных
+		hFile = CreateFile("Test.dat", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+		if(hFile == INVALID_HANDLE_VALUE) TerminateApplication(" Open file 'Test.dat' --> Failed!!!\n", TRUE);
+		else printf(" CreateFile(Test.dat) --> Ok\n");
+
+		// теперь запишем в файл полученные данные
+		FileBytesWritten = 0x0;
+		if(!WriteFile(	hFile,							// handle to file to ite to
+	    					ReadBuffer,						// pointer to data to ite to file
+							2*NBlockRead*DataStep,		// number of bytes to ite
+    						&FileBytesWritten,			// pointer to number of bytes itten
+					   	NULL			  					// pointer to structure needed for overlapped I/O
+					   ))  TerminateApplication(" WriteFile(Test.dat) --> Failed!!!", TRUE);
+		else printf(" WriteFile(Test.dat) --> Ok\n");
+	}
+
+	// если была ошибка - сообщим об этом
+	if(ThreadErrorNumber) { TerminateApplication(NULL, FALSE); ShowThreadErrorMessage(); }
+	else { printf("\n"); TerminateApplication("\n The program was completed successfully!!!\n", FALSE); }
+}
+
+//------------------------------------------------------------------------
+// Поток в котором осуществляется ввод данных в РС из модуля
+//------------------------------------------------------------------------
+DWORD WINAPI ServiceReadThread(PVOID Context)
+{
+	WORD RequestNumber;
+	WORD i;
+	// идентификатор массива их двух событий
+	HANDLE ReadEvent[2];
+	// массив OVERLAPPED структур из двух элементов
+	OVERLAPPED ReadOv[2];
+	DWORD BytesTransferred[2];
+//	DWORD TimeOut;
+
+	// остановим ввод данных и одновременно прочистим соответствующий канал bulk USB
+	if(!STOP_READ_Usb3000(pModule)) { ThreadErrorNumber = 0x6; IsThreadComplete = TRUE; return 0; }
+
+	// создадим два события
+	ReadEvent[0] = CreateEvent(NULL, FALSE , FALSE, NULL);
+	memset(&ReadOv[0], 0, sizeof(OVERLAPPED)); ReadOv[0].hEvent = ReadEvent[0];
+	ReadEvent[1] = CreateEvent(NULL, FALSE , FALSE, NULL);
+	memset(&ReadOv[1], 0, sizeof(OVERLAPPED)); ReadOv[1].hEvent = ReadEvent[1];
+
+	// таймаут ввода данных
+//	TimeOut = (DWORD)(DataStep/ReadRate) + 1000;
+
+	// делаем предварительный запрос на ввод данных
+	RequestNumber = 0;
+	if(!ReadData_Usb3000(pModule, ReadBuffer, &DataStep, &BytesTransferred[RequestNumber], &ReadOv[RequestNumber]))
+				if(GetLastError() != ERROR_IO_PENDING) { CloseHandle(ReadEvent[0]); CloseHandle(ReadEvent[1]); ThreadErrorNumber = 0x2; IsThreadComplete = TRUE; return 0; }
+
+	// теперь запускаем ввод данных
+	if(START_READ_Usb3000(pModule))
+	{
+		// цикл сбора данных
+		for(i = 0x1; i < NBlockRead; i++)
+		{
+			RequestNumber ^= 0x1;
+			// сделаем запрос на очередную порции данных
+			if(!ReadData_Usb3000(pModule, ReadBuffer + i*DataStep, &DataStep, &BytesTransferred[RequestNumber], &ReadOv[RequestNumber]))
+					if(GetLastError() != ERROR_IO_PENDING) { ThreadErrorNumber = 0x2; break; }
+
+			// ждём окончания операции сбора очередной порции данных
+			if(!WaitingForRequestCompleted(&ReadOv[RequestNumber^0x1])) break;
+//			if(WaitForSingleObject(ReadEvent[RequestNumber^0x1], TimeOut) == WAIT_TIMEOUT)
+//				            		{ ThreadErrorNumber = 0x3; break; }
+
+			if(ThreadErrorNumber) break;
+			else if(kbhit()) { ThreadErrorNumber = 0x1; break; }
+			else Sleep(20);
+			Counter++;
+		}
+
+		// ждём завершения операции сбора последней порции данных
+		if(!ThreadErrorNumber)
+		{
+			RequestNumber ^= 0x1;
+			WaitingForRequestCompleted(&ReadOv[RequestNumber^0x1]);
+//			if(WaitForSingleObject(ReadEvent[RequestNumber^0x1], TimeOut) == WAIT_TIMEOUT) ThreadErrorNumber = 0x3;
+			Counter++;
+		}
+	}
+	else { ThreadErrorNumber = 0x5; }
+
+	// остановим ввод данных
+	if(!STOP_READ_Usb3000(pModule)) ThreadErrorNumber = 0x6;
+	// если надо, то прервём незавершённый асинхронный запрос
+	if(!CancelIo(GetModuleHandle_Usb3000(pModule))) ThreadErrorNumber = 0x7;
+	// освободим все идентификаторы событий
+	for(i = 0x0; i < 0x2; i++) CloseHandle(ReadEvent[i]);
+	// небольшая задержка
+	Sleep(100);
+	// установим флажок окончания потока сбора данных
+	IsThreadComplete = TRUE;
+	// теперь можно воходить из потока сбора данных
+	return 0;
+}
+
+//---------------------------------------------------------------------------
+//
+//---------------------------------------------------------------------------
+BOOL WaitingForRequestCompleted(OVERLAPPED *ReadOv)
+{
+	DWORD ReadBytesTransferred;
+
+	while(TRUE)
+	{
+		if(GetOverlappedResult(ModuleHandle, ReadOv, &ReadBytesTransferred, FALSE)) break;
+		else if(GetLastError() !=  ERROR_IO_INCOMPLETE) { ThreadErrorNumber = 0x3; return FALSE; }
+		else if(kbhit()) { ThreadErrorNumber = 0x1; return FALSE; }
+		else Sleep(20);
+	}
+	return TRUE;
+}
+
+//------------------------------------------------------------------------
+// Отобразим сообщение с ошибкой
+//------------------------------------------------------------------------
+void ShowThreadErrorMessage(void)
+{
+	switch(ThreadErrorNumber)
+	{
+		case 0x0:
+			break;
+
+		case 0x1:
+			// если программа была злобно прервана, предъявим ноту протеста
+			printf("\n READ Thread: The program was terminated! :(((\n");
+			break;
+
+		case 0x2:
+			printf("\n READ Thread: ReadData() --> Bad :(((\n");
+			break;
+
+		case 0x3:
+			printf("\n READ Thread: Read Request --> Bad :(((\n");
+//			printf("\n READ Thread: Timeout is occured :(((\n");
+			break;
+
+		case 0x4:
+			printf("\n READ Thread: Buffer Data Error! :(((\n");
+			break;
+
+		case 0x5:
+			printf("\n READ Thread: START_READ() --> Bad :(((\n");
+			break;
+
+		case 0x6:
+			printf("\n READ Thread: STOP_READ() --> Bad! :(((\n");
+			break;
+
+		case 0x7:
+			printf("\n READ Thread: Can't complete input and output (I/O) operations! :(((");
+			break;
+
+		default:
+			printf("\n READ Thread: Unknown error! :(((\n");
+			break;
+	}
+
+	return;
+}
+
+//------------------------------------------------------------------------
+// вывод сообщения и, если нужно, аварийный выход из программы
+//------------------------------------------------------------------------
+void TerminateApplication(char *ErrorString, BOOL TerminationFlag)
+{
+	// подчищаем интерфейс модуля
+	if(pModule)
+	{ 
+		// освободим интерфейс модуля
+		if(!ReleaseInstance_Usb3000(pModule)) printf(" ReleaseInstance_Usb3000() --> Bad\n", TRUE);
+		else printf(" ReleaseInstance_Usb3000() --> OK\n");
+		// обнулим указатель на интерфейс модуля
+		pModule = NULL; 
+	}
+
+	// подчищаем за собой
+	if(ReadBuffer) { free(ReadBuffer); ReadBuffer = NULL; }
+	// освободим идентификатор потока сбора данных
+	if(hReadThread) { CloseHandle(hReadThread); hReadThread = NULL; }
+	// освободим идентификатор файла данных
+	if(hFile != INVALID_HANDLE_VALUE) { CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE; }
+
+	// выводим текст сообщения
+	if(ErrorString) printf(ErrorString);
+
+	// если нужно - аварийно завершаем программу
+	if(TerminationFlag) exit(1);
+	else return;
+}
